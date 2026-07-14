@@ -1,18 +1,17 @@
 """
-Orchestrator: load data -> build datasets -> train -> evaluate -> save artifacts.
+Orchestrator: load data -> build session sequences -> train -> evaluate -> save artifacts.
 
 Usage:
     python main.py [--data-dir DIR] [--epochs N] [--size PCT]
 
     --size PCT   Keep only PCT% of the dataset, by randomly sampling whole
-                 accounts (not rows) so sessions stay intact. E.g.
-                 `--size 10` keeps a random ~10% of accounts in each split.
-                 Omit to use the full dataset.
+                 accounts (not rows), so sessions stay intact. Omit to
+                 use the full dataset.
 """
 import argparse
 import json
 import os
-from datetime import datetime # Added
+from datetime import datetime
 
 import torch
 
@@ -22,6 +21,7 @@ from model import build_model
 from trainer import train_model
 from evaluate import evaluate_model
 from plots import plot_learning_curves, plot_predictions
+
 
 def set_seed(seed: int):
     import random
@@ -48,7 +48,6 @@ def main():
 
     cfg.EPOCHS = args.epochs
 
-    # Create timestamped directory
     timestamp = datetime.now().strftime("%d%m%y-%H-%M-%S")
     run_dir = os.path.join(args.output_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -64,8 +63,10 @@ def main():
     for name, d in splits.items():
         print(f"  {name}: {len(d):,} rows")
 
-    print("Building preprocessed datasets ...")
+    print("Building preprocessed session sequences ...")
     datasets, preprocessor = build_datasets(splits)
+    for name, ds in datasets.items():
+        print(f"  {name}: {len(ds):,} sessions")
     loaders = build_dataloaders(datasets)
 
     n_features = preprocessor.n_features
@@ -74,22 +75,18 @@ def main():
     model = build_model(n_features)
     print(model)
 
-    # Pass the new timestamped directory
     model, history = train_model(model, loaders, output_dir=run_dir)
 
     device = torch.device(cfg.DEVICE if torch.cuda.is_available() else "cpu")
     print("Evaluating on test split ...")
 
-    # Unpack metrics and plot_data
     test_metrics, plot_data = evaluate_model(model, loaders["test"], device)
     print(json.dumps(test_metrics, indent=2))
 
-    # Generate and save plots
     plot_learning_curves(history, run_dir)
     plot_predictions(plot_data["spins_true"], plot_data["spins_pred"], "spins_left", run_dir)
     plot_predictions(plot_data["bet_true"], plot_data["bet_pred"], "next_bet", run_dir)
 
-    # Save artifacts to the new timestamped directory
     with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
         json.dump(test_metrics, f, indent=2)
 
@@ -103,6 +100,7 @@ def main():
     }, os.path.join(run_dir, "spin_model.pt"))
 
     print(f"Saved model, metrics, and plots to {run_dir}")
+
 
 if __name__ == "__main__":
     main()

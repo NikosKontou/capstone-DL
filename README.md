@@ -1,78 +1,166 @@
-# Per-Spin Multi-Task Deep Learning Model
+# Spin Sequence Model
 
-Predicts, for every spin row in `full_merged_sorted_data.parquet`:
+Predicts, for a player's in-progress slot session, **how many spins are
+left in the session** and **the size of the next bet** — as a running
+time series that updates after every spin, not a single snapshot
+prediction.
 
-1. **`spins_left_in_session`** — regression, count of remaining spins in the session
-2. **`next_spin_amount`** — regression, bet size of the following spin (NULL/undefined on the terminal spin of each session)
+This is a sequence model: it reads a session's spins in order (bet
+size, RTP outcome, timing, etc.) and carries what it's seen forward
+through an LSTM, rather than relying on hand-engineered lag features
+computed one step at a time.
 
-This slots into the existing pipeline described in the technical summary — same split-aware feature set, same `split_name` train/valid/test partitioning — as a third, per-spin sibling to the `will_return_7d` classifier and the `time_to_next_session_day` regressor.
+---
 
-## Why a multi-task MLP
+## Pipeline overview
 
-Every row already carries the lag-1 spin features (`prev_bet`, `prev_win`, `prev_rtp_bucket_id`) and expanding-window player-history features computed in SQL, so the within-session temporal signal is already flattened into the feature vector — a plain tabular network is the right first model, not a sequence model. Section 8 (future work) already earmarks LSTM/Transformer upgrades if longer within-session dependencies turn out to matter; this architecture is the natural stepping stone.
-
-The two targets share a trunk because they're correlated (a player about to leave typically also isn't placing another bet) — joint training lets the shared representation pick up on that.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `config.py` | All tunable constants — paths, feature lists, architecture, training hyperparameters |
-| `data_loader.py` | Preprocessing (train-only fit scalers/medians), missing-indicator construction, `Dataset`/`DataLoader` |
-| `model.py` | `SpinMultiTaskNet` — shared MLP trunk + two Softplus regression heads |
-| `trainer.py` | Training loop: masked loss, early stopping, `ReduceLROnPlateau`, gradient clipping |
-| `evaluate.py` | MAE/RMSE/R²/within-1-unit metrics, masked correctly for `next_spin_amount` |
-| `main.py` | Orchestrator — run this to train end-to-end |
-| `inference.py` | `SpinPredictor` class for scoring new spin rows from a saved checkpoint |
-| `make_sample_data.py` | Generates synthetic data matching your schema, for smoke-testing only |
-
-## Key design decisions
-
-- **Masked loss for `next_spin_amount`.** The terminal spin of every session has no "next spin" (NULL in the source data). Rather than dropping those rows — which would throw away the single most informative row per session for `spins_left_in_session` (where the target is exactly 0) — the row is kept, and a `next_bet_mask` tensor zeroes out its contribution to the `next_spin_amount` loss only. Both heads therefore see full data for their own task.
-- **Missing-value indicators, not just imputation.** `prev_bet`, `prev_win`, `prev_rtp_bucket_id`, and `days_since_last_session` are `NaN` on the first spin of a session by construction (no prior spin exists). These are median-imputed *and* paired with a `_was_missing` binary flag, so the network can distinguish "first spin of session" from "observed value happens to equal the median."
-- **Train-only preprocessing fit.** Scaler means/stds and imputation medians are fit on `split_name == 'train'` only and applied unchanged to `valid`/`test`, consistent with the leakage-avoidance design already used for the player-history window features in the SQL layer.
-- **Softplus output heads.** Both targets are non-negative counts/amounts. Softplus keeps predictions ≥ 0 without the dead-gradient problem a ReLU output can have.
-- **One-hot columns passed through as-is.** `game_id`, `game_provider_id`, `currency_id`, `device_id` are already one-hot encoded upstream in SQL (per Section 3.6), so they bypass the numeric scaler and go straight into the input vector.
-
-## Running on the real dataset
-
-Train/valid/test live in **three separate parquet files** (not one file with a `split_name` column to filter on), matching your actual pipeline output.
-
-1. Point `config.DATA_DIR` (or `--data-dir`) at the directory holding `train.parquet`, `valid.parquet`, `test.parquet` — or pass `--train-file` / `--valid-file` / `--test-file` if they're named differently. Each file must contain every column in `config.NUMERIC_FEATURES`, `config.ONEHOT_FEATURES`, `spins_left_in_session`, and `next_spin_amount`.
-2. `python main.py --data-dir /path/to/splits --epochs 60`
-3. Artifacts land in `outputs/`: `spin_model.pt` (weights + preprocessing state), `history.json` (per-epoch losses), `test_metrics.json`.
-4. Score new rows with `inference.SpinPredictor("outputs/spin_model.pt").predict(df)`.
-
-### Working with a subset of the data
-
-The full dataset can be large enough that you want to iterate on a smaller slice first. `--size PCT` keeps only `PCT`% of the data:
-
-```bash
-python main.py --data-dir /path/to/splits --size 10   # ~10% of the data
+```
+build_features.sql          DuckDB feature pipeline (raw events -> parquet)
+        |
+        v
+config.py       -- all paths, feature lists, and hyperparameters
+data_loader.py  -- groups rows into per-session sequences, preprocesses,
+                    pads/collates batches for the LSTM
+model.py        -- SpinMultiTaskNet: LSTM + two prediction heads
+trainer.py      -- training loop, masked multi-task loss
+evaluate.py     -- test-set metrics (per-step and last-step)
+inference.py    -- SpinPredictor: serve predictions on a live session
+plots.py        -- learning curves + prediction scatter plots
+main.py         -- orchestrates all of the above end to end
 ```
 
-Subsampling is done **by account, not by row**, independently within each split, and the filtering happens *during* the parquet read rather than after loading the full file into memory. An account's spins span one or more full sessions, and slicing rows directly would cut a session mid-stream — corrupting `spins_left_in_session` (which counts down to the true end of the session) and the `prev_*` lag features for whatever row happened to land at the cut. Sampling whole accounts keeps every kept session fully intact, and train/valid/test each keep their original relative proportions since the sampling happens per split.
-
-Under the hood: only the `account` column is read first (a cheap columnar read) to decide which accounts to keep, then the rest of each file is read via a PyArrow dataset scan with an `account.isin(keep_accounts)` filter pushed down to the reader -- row groups containing no kept accounts are skipped, and only matching rows are ever materialized into a DataFrame. The full unfiltered file is never held in memory at once, which matters once the real dataset no longer fits comfortably in RAM.
-
-Omit `--size` to train on the full dataset.
-
-If your files also happen to carry a `split_name` column, `load_splits()` checks it against the file each row came from and raises an error on any mismatch — this catches the class of bug where a file gets loaded into the wrong slot (e.g. `valid.parquet` accidentally pointed to by `--test-file`). It is not used to filter rows.
-
-## Smoke test
-
-`make_sample_data.py` generates synthetic `train.parquet` / `valid.parquet` / `test.parquet` with the same columns/dtypes so you can verify the pipeline runs before pointing it at the full 2.4M-row dataset:
+Run a full training job with:
 
 ```bash
-python make_sample_data.py     # writes train.parquet, valid.parquet, test.parquet
-python main.py --epochs 15     # trains on the synthetic data
-python inference.py            # scores 10 rows and prints predictions vs ground truth
+python main.py
+python main.py --size 10        # quick run on ~10% of accounts
+python main.py --epochs 30 --data-dir /path/to/parquet/dir
 ```
 
-On synthetic data (session length generated independently of features, so this understates real performance): `spins_left_in_session` MAE ≈ 6.6 vs a 7.7 median baseline, `next_spin_amount` R² ≈ 0.97 (bet amount is highly self-correlated within a session in the synthetic generator). Expect materially better `spins_left_in_session` performance on the real data, where session length correlates with `player_avg_round_duration`, `hour_of_day`, `bet_change_direction_id`, and other genuine behavioural signal that the synthetic generator doesn't encode.
+Each run writes a timestamped folder under `OUTPUT_DIR` (see
+`config.py`) containing `spin_model.pt` (the trained checkpoint),
+`history.json`, `test_metrics.json`, and the plots.
 
-## Tuning knobs worth trying first
+---
 
-- `LOSS_WEIGHT_SPINS_LEFT` / `LOSS_WEIGHT_NEXT_BET` in `config.py` — rebalance if one head dominates the shared trunk's gradients (watch the per-head MSE printed each epoch).
-- `HIDDEN_DIMS` — current `[256, 128, 64]` is a reasonable default for ~45 input features; widen if underfitting on the full 2.4M rows.
-- Consider log1p-transforming `next_spin_amount` before training (mirroring the `log1p(days)` treatment already used for `time_to_next_session_day` in Section 5.2) if bet-amount distributions turn out to be as right-skewed as the session-gap target.
+## What "sequence model" means here, concretely
+
+**Unit of training data:** one *session* (all of a player's spins from
+session start to session end, or the most recent `MAX_SEQ_LEN=64`
+spins for very long sessions), not one spin. Each session is a matrix
+of shape `(T, F)` — `T` spins, `F` features per spin.
+
+**No lag features.** The old row-level model computed `prev_bet`,
+`prev_win`, `prev_rtp_bucket_id`, `bet_change_direction_id` upstream in
+SQL as hand-crafted "memory." Those are gone — an LSTM sees the raw
+per-step sequence directly and learns any such relationship itself, so
+computing them separately was both redundant and slower to build.
+`inter_spin_gap_sec` is the one exception kept, since it's a genuine
+computed gap the model can't reconstruct from the other retained
+columns.
+
+**Causal by construction.** The LSTM is unidirectional
+(`bidirectional=False` in `model.py`) — its prediction at spin `t` is
+mathematically a function of spins `1..t` only, never spins after `t`.
+The player-level aggregate features (`player_avg_bet`,
+`player_round_count`, etc.) are also computed upstream using `ROWS
+BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING`, so they only reflect
+history strictly before the current row. No future leakage anywhere in
+the stack.
+
+**Per-step predictions, per-step loss.** The model predicts
+`spins_left` and `next_bet` at *every* timestep in a session, not just
+the last one. Training backpropagates a loss at every valid timestep
+in every session in a batch — a single 20-spin session contributes up
+to 20 training signals for `spins_left` and up to 19 for `next_bet`
+(all but the terminal spin, which has no "next spin" to predict).
+
+**Padding and masking.** Batches contain sessions of different
+lengths, so shorter ones are zero-padded up to the longest session in
+the batch. Two masks (`padding_mask`, `next_bet_mask`) ensure padded
+and terminal-spin positions never contribute to the loss —
+`pack_padded_sequence`/`pad_packed_sequence` also keep padding out of
+the LSTM's recurrence entirely, not just out of the loss.
+
+---
+
+## Serving / inference
+
+`inference.py`'s `SpinPredictor` has a different contract than a
+row-level model would: `predict()` takes a **session's spin history so
+far** (a DataFrame of consecutive spins, oldest first), not a single
+row, because the LSTM needs that history in its hidden state to
+produce a meaningful prediction.
+
+```python
+from inference import SpinPredictor
+
+predictor = SpinPredictor("path/to/spin_model.pt")
+
+# session_so_far: DataFrame of this session's spins, oldest first
+spins_left, next_bet = predictor.predict(session_so_far)
+
+# Optional: predictions at every step of the session, not just the last
+spins_left_seq, next_bet_seq = predictor.predict_all_steps(session_so_far)
+```
+
+A single-spin history (session just started) is valid input — the
+LSTM simply has no prior hidden state to draw on yet, same as during
+training.
+
+---
+
+## Evaluation
+
+`evaluate.py` reports two metric sets in `test_metrics.json`:
+
+- **`per_step`** — computed over every valid timestep across every
+  test session. Uses the most data, reflects the model's typical
+  accuracy at an arbitrary point in a session.
+- **`last_step`** — computed only at the last real timestep of each
+  session (for `spins_left`) or the last timestep with a valid target
+  (for `next_bet`, since the literal last spin of a session never has
+  a "next spin"). This is the metric to compare against a row-level
+  baseline model, since it's the closest match to "one prediction per
+  session, as late as possible."
+
+---
+
+## Feature pipeline (`build_features.sql`)
+
+Builds `train/valid/test_features_fix.parquet` from raw spin events in
+DuckDB. Notable behavior:
+
+- Sessions containing a very long round (>500s) that **isn't** the
+  final spin of the session are dropped entirely (likely a logging
+  gap or AFK period, not real play).
+- `next_session_bucket_id` buckets time-to-next-session into same-day
+  / next-day / within-a-week / within-two-weeks / within-a-month /
+  churned, mirroring the style of `rtp_bucket_id`.
+- Session-recency window functions (`LAG`/`LEAD` over
+  `session_start`) break ties on `sessionid`, so two sessions with an
+  identical start time for the same account resolve deterministically
+  instead of producing arbitrary `NULL`s.
+- `is_first_session` / `is_last_session` flags make it explicit when
+  `days_since_last_session` or `time_to_next_session_*` are `NULL` by
+  genuine absence of a prior/next session, rather than leaving that to
+  be silently inferred downstream.
+- Output is ordered by `account, starttime` (not just `starttime`),
+  since the Python pipeline needs rows grouped by account, in time
+  order, to build session sequences.
+
+---
+
+## Known limitations / things to check before trusting results
+
+- `MAX_SEQ_LEN=64` truncates long sessions to their most recent 64
+  spins; very long sessions lose their earliest spins from the input
+  window entirely.
+- `MIN_SEQ_LEN=2` drops single-spin sessions, since there's no
+  meaningful sequence to learn from.
+- The `last_step` metrics are the fairest comparison point against the
+  old row-level model's numbers — run both and compare before
+  concluding the sequence model is actually an improvement.
+- This has only been validated end-to-end against synthetic data
+  matching the parquet schema, not the real dataset. Run `main.py` on
+  a small `--size` sample of the real data first.

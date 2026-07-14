@@ -1,19 +1,22 @@
 """
-Training loop for the multi-task spin model.
+Training loop for the sequence (time-series) multi-task spin model.
 
-Loss = w1 * MSE(spins_left_pred, spins_left_true)
-     + w2 * masked_MSE(next_bet_pred, next_bet_true)
+Loss = w1 * masked_MSE(spins_left_pred, spins_left_true, padding_mask)
+     + w2 * masked_MSE(next_bet_pred, next_bet_true, padding_mask & next_bet_mask)
 
-masked_MSE excludes terminal-spin rows, where next_spin_amount has no
-ground truth (there is no "next spin"). Without the mask those rows would
-train the next_bet head toward the fill value (0), corrupting it.
+Two masks are needed now (unlike the row-level model, which only
+needed one): padding_mask excludes padded timesteps from *both* heads,
+and next_bet_mask additionally excludes terminal-spin timesteps (no
+ground truth "next spin") from the next_bet head only. These are
+combined once in the data loader's collate_fn into
+`next_bet_mask` (already padding-aware) and `padding_mask` (for the
+spins_left head), so this file just consumes them directly.
 """
 import copy
 import json
 import os
 import time
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -32,14 +35,16 @@ def run_epoch(model, loader, optimizer, device, train: bool):
 
     for batch in loader:
         x = batch["x"].to(device)
+        lengths = batch["lengths"]  # stays on CPU, pack_padded_sequence requires it
         y_spins_left = batch["y_spins_left"].to(device)
         y_next_bet = batch["y_next_bet"].to(device)
-        mask = batch["next_bet_mask"].to(device)
+        next_bet_mask = batch["next_bet_mask"].to(device)
+        padding_mask = batch["padding_mask"].to(device)
 
         with torch.set_grad_enabled(train):
-            pred_spins_left, pred_next_bet = model(x)
-            loss_spins = nn.functional.mse_loss(pred_spins_left, y_spins_left)
-            loss_bet = masked_mse(pred_next_bet, y_next_bet, mask)
+            pred_spins_left, pred_next_bet = model(x, lengths)
+            loss_spins = masked_mse(pred_spins_left, y_spins_left, padding_mask)
+            loss_bet = masked_mse(pred_next_bet, y_next_bet, next_bet_mask)
             loss = (cfg.LOSS_WEIGHT_SPINS_LEFT * loss_spins
                     + cfg.LOSS_WEIGHT_NEXT_BET * loss_bet)
 

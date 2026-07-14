@@ -99,6 +99,108 @@ def regression_metrics(y_true, y_pred, name):
     }
 
 
+@torch.no_grad()
+def permutation_feature_importance(model, loader, device, feature_names: list,
+                                     n_repeats: int = 3, seed: int = 42,
+                                     max_batches: int = 20):
+    """
+    Model-agnostic feature importance for the sequence model (there's no
+    built-in importance like a tree model has for an LSTM). For each
+    feature column, shuffle that column's values across the batch
+    dimension at every valid timestep, independently per batch,
+    independently per repeat -- this breaks the feature's association
+    with the target while leaving every other feature's values, and
+    the temporal structure of the sequence, untouched. Importance is
+    how much validation loss gets worse when that feature is
+    shuffled: a feature the model actually relies on will hurt more
+    when scrambled than a feature it ignores.
+
+    Computed separately for each head (spins_left, next_bet) since a
+    feature can matter to one task and not the other. Reuses the same
+    masked-MSE loss as training so this is measuring exactly what the
+    model was optimized against, not a proxy metric.
+
+    Shuffling is done PER BATCH rather than once globally: this keeps
+    memory bounded (we never materialize a full shuffled dataset) and
+    still gives each feature many independent permutations across
+    n_repeats x n_batches, which is what the importance scores are
+    averaged over.
+
+    Cost note: this runs n_features x n_repeats extra forward passes
+    per batch (~40 features x 3 repeats = 120x a normal eval pass), so
+    it's capped at max_batches batches by default rather than running
+    over the full loader -- pass a validation loader with a smaller
+    batch_size, or raise max_batches, if more precision is needed.
+
+    Returns a dict: {feature_name: {"spins_left_importance": float,
+    "next_bet_importance": float}}, where importance is the mean
+    increase in masked MSE loss (post-shuffle minus baseline) across
+    all repeats and batches. Higher = more important.
+    """
+    from trainer import masked_mse  # local import: avoids a circular import at module load time
+
+    model.eval()
+    rng = np.random.default_rng(seed)
+    n_features = len(feature_names)
+
+    baseline_spins_loss = 0.0
+    baseline_bet_loss = 0.0
+    shuffled_spins_loss = np.zeros(n_features)
+    shuffled_bet_loss = np.zeros(n_features)
+    n_batches = 0
+
+    # Cache a bounded number of batches so the same baseline forward
+    # pass and the same shuffled inputs are reused across every
+    # feature column, and so cost stays predictable regardless of
+    # dataset size.
+    batches = []
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        batches.append(batch)
+
+    for batch in batches:
+        x = batch["x"].to(device)
+        lengths = batch["lengths"]
+        y_spins_left = batch["y_spins_left"].to(device)
+        y_next_bet = batch["y_next_bet"].to(device)
+        next_bet_mask = batch["next_bet_mask"].to(device)
+        padding_mask = batch["padding_mask"].to(device)
+
+        pred_spins_left, pred_next_bet = model(x, lengths)
+        baseline_spins_loss += masked_mse(pred_spins_left, y_spins_left, padding_mask).item()
+        baseline_bet_loss += masked_mse(pred_next_bet, y_next_bet, next_bet_mask).item()
+        n_batches += 1
+
+        B = x.shape[0]
+        for f in range(n_features):
+            for _ in range(n_repeats):
+                x_shuffled = x.clone()
+                perm = torch.from_numpy(rng.permutation(B))
+                # Shuffle this feature's values across sessions in the
+                # batch; padded positions get shuffled too but never
+                # affect the loss since padding_mask/next_bet_mask
+                # exclude them regardless.
+                x_shuffled[:, :, f] = x[perm, :, f]
+
+                p_spins, p_bet = model(x_shuffled, lengths)
+                shuffled_spins_loss[f] += masked_mse(p_spins, y_spins_left, padding_mask).item()
+                shuffled_bet_loss[f] += masked_mse(p_bet, y_next_bet, next_bet_mask).item()
+
+    baseline_spins_loss /= n_batches
+    baseline_bet_loss /= n_batches
+    shuffled_spins_loss /= (n_batches * n_repeats)
+    shuffled_bet_loss /= (n_batches * n_repeats)
+
+    importance = {}
+    for f, name in enumerate(feature_names):
+        importance[name] = {
+            "spins_left_importance": float(shuffled_spins_loss[f] - baseline_spins_loss),
+            "next_bet_importance": float(shuffled_bet_loss[f] - baseline_bet_loss),
+        }
+    return importance
+
+
 def evaluate_model(model, loader, device):
     flat, last_step = predict(model, loader, device)
 

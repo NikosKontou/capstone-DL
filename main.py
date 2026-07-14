@@ -19,8 +19,8 @@ import config as cfg
 from data_loader import load_splits, build_datasets, build_dataloaders
 from model import build_model
 from trainer import train_model
-from evaluate import evaluate_model
-from plots import plot_learning_curves, plot_predictions
+from evaluate import evaluate_model, permutation_feature_importance
+from plots import plot_learning_curves, plot_predictions, plot_feature_importance
 
 
 def set_seed(seed: int):
@@ -83,12 +83,26 @@ def main():
     test_metrics, plot_data = evaluate_model(model, loaders["test"], device)
     print(json.dumps(test_metrics, indent=2))
 
+    print("Computing permutation feature importance on the validation split ...")
+    # Uses the validation loader, not test: keeps test purely for the
+    # final reported metrics, and validation is typically the smaller
+    # split anyway which keeps this (relatively expensive) computation
+    # fast. See evaluate.permutation_feature_importance's docstring
+    # for the cost tradeoff and max_batches cap.
+    feature_importance = permutation_feature_importance(
+        model, loaders["valid"], device, feature_names=preprocessor.all_feature_names
+    )
+
     plot_learning_curves(history, run_dir)
     plot_predictions(plot_data["spins_true"], plot_data["spins_pred"], "spins_left", run_dir)
     plot_predictions(plot_data["bet_true"], plot_data["bet_pred"], "next_bet", run_dir)
+    plot_feature_importance(feature_importance, run_dir)
 
     with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
         json.dump(test_metrics, f, indent=2)
+
+    with open(os.path.join(run_dir, "feature_importance.json"), "w") as f:
+        json.dump(feature_importance, f, indent=2)
 
     torch.save({
         "model_state_dict": model.state_dict(),

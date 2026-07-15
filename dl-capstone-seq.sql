@@ -136,8 +136,73 @@ SELECT account, sessionid, MIN(starttime) AS session_start, MAX(endtime) AS sess
 FROM _cleaned GROUP BY account, sessionid;
 
 -- ---------------------------------------------------------------------
+-- Split boundaries are computed here, right after _session_endpoints,
+-- and BEFORE any session-recency features. This ordering is the fix
+-- for a data-leakage bug: recency features (days_since_last_session,
+-- time_to_next_session_*, is_first_session, is_last_session,
+-- next_session_bucket_id, back_in_3_days) need to know split_name
+-- before they run, so an account's session history doesn't get
+-- chained across split boundaries (e.g. a test-split session's
+-- "days since last session" silently reaching back into a
+-- validation- or train-split session for that same account, which a
+-- production system evaluating on genuinely held-out time would never
+-- have access to).
+--
+-- The date cutoffs themselves are legitimately global: deciding WHERE
+-- the train/valid/test time boundaries fall requires looking at the
+-- full account/session timeline once. That's a one-time calendar
+-- decision, not a per-row feature leaking target-adjacent information,
+-- so _session_endpoints (built across all sessions) is the correct
+-- input here.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE TABLE _split_boundaries AS
+WITH nominal AS (
+    SELECT
+        MIN(starttime)                                                   AS data_start,
+        DATE_TRUNC('month', MIN(starttime)) + INTERVAL 2 MONTH           AS train_nominal,
+        DATE_TRUNC('month', MIN(starttime)) + INTERVAL 2 MONTH + INTERVAL 11 DAY AS valid_nominal,
+        MAX(endtime)                                                     AS data_end
+    FROM _cleaned
+)
+SELECT
+    n.data_start, n.data_end, n.train_nominal, n.valid_nominal,
+    MAX(CASE WHEN e.session_end <= n.train_nominal THEN e.session_end END) AS actual_train_end,
+    MAX(CASE WHEN e.session_end <= n.valid_nominal THEN e.session_end END) AS actual_valid_end,
+    n.data_end AS actual_test_end
+FROM nominal n
+CROSS JOIN _session_endpoints e
+GROUP BY n.data_start, n.data_end, n.train_nominal, n.valid_nominal;
+
+-- Attach split_name to each session BEFORE computing recency features,
+-- so the recency window functions below can partition by
+-- (account, split_name) instead of account alone.
+CREATE OR REPLACE TABLE _session_endpoints_with_split AS
+SELECT
+    e.*,
+    CASE
+        WHEN e.session_end <= b.actual_train_end THEN 'train'
+        WHEN e.session_end <= b.actual_valid_end THEN 'valid'
+        ELSE 'test'
+    END AS split_name
+FROM _session_endpoints e
+CROSS JOIN _split_boundaries b;
+
+-- ---------------------------------------------------------------------
 -- Session recency features.
---   * LAG/LEAD now order by (session_start, sessionid) so that two
+--   * Partitioned by (account, split_name), NOT account alone. This is
+--     the leakage fix: an account's session ordering now resets at
+--     each split boundary, so prev_session_end / next_session_start
+--     never reach across from train into valid, or valid into test.
+--     A session that is an account's first session within a given
+--     split will correctly show is_first_session=1 and a NULL
+--     days_since_last_session, even if that account has earlier
+--     sessions in a different split -- this is intentional: it makes
+--     each split behave as if it starts with no lookback into a
+--     different split, matching how a production system evaluated on
+--     genuinely held-out time would behave. Expect valid/test to have
+--     a higher proportion of "first session" rows than train, since
+--     each split's first calendar session per account trips this flag.
+--   * LAG/LEAD order by (session_start, sessionid) so that two
 --     sessions with an identical session_start for the same account
 --     resolve deterministically instead of depending on arbitrary
 --     row order, which previously could push a real "next session"
@@ -150,19 +215,20 @@ FROM _cleaned GROUP BY account, sessionid;
 --     next_session_start before the CASE branch is chosen.
 --   * is_first_session flags rows where prev_session_end IS NULL, so
 --     the NULL in days_since_last_session is legible as "first
---     session for this account" rather than an unexplained missing
---     value that downstream code has to guess about.
+--     session for this account (in this split)" rather than an
+--     unexplained missing value that downstream code has to guess
+--     about.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE TABLE _session_recency AS
 WITH ordered AS (
     SELECT
-        account, sessionid, session_start, session_end,
-        LAG(session_end)    OVER (PARTITION BY account ORDER BY session_start, sessionid) AS prev_session_end,
-        LEAD(session_start) OVER (PARTITION BY account ORDER BY session_start, sessionid) AS next_session_start
-    FROM _session_endpoints
+        account, sessionid, split_name, session_start, session_end,
+        LAG(session_end)    OVER (PARTITION BY account, split_name ORDER BY session_start, sessionid) AS prev_session_end,
+        LEAD(session_start) OVER (PARTITION BY account, split_name ORDER BY session_start, sessionid) AS next_session_start
+    FROM _session_endpoints_with_split
 )
 SELECT
-    account, sessionid, session_end, next_session_start, prev_session_end,
+    account, sessionid, split_name, session_end, next_session_start, prev_session_end,
     CASE WHEN next_session_start IS NULL THEN 1 ELSE 0 END::INTEGER      AS is_last_session,
     CASE WHEN prev_session_end    IS NULL THEN 1 ELSE 0 END::INTEGER     AS is_first_session,
     CASE
@@ -205,6 +271,7 @@ FROM _session_recency;
 CREATE OR REPLACE TABLE _cleaned_with_recency AS
 SELECT
     c.*,
+    r.split_name,
     r.session_end,
     r.next_session_start,
     r.is_first_session,
@@ -227,37 +294,8 @@ SELECT
 FROM _cleaned c
 LEFT JOIN _session_recency_bucketed r USING (account, sessionid);
 
-CREATE OR REPLACE TABLE _split_boundaries AS
-WITH nominal AS (
-    SELECT
-        MIN(starttime)                                                   AS data_start,
-        DATE_TRUNC('month', MIN(starttime)) + INTERVAL 2 MONTH           AS train_nominal,
-        DATE_TRUNC('month', MIN(starttime)) + INTERVAL 2 MONTH + INTERVAL 11 DAY AS valid_nominal,
-        MAX(endtime)                                                     AS data_end
-    FROM _cleaned_with_recency
-)
-SELECT
-    n.data_start, n.data_end, n.train_nominal, n.valid_nominal,
-    MAX(CASE WHEN e.session_end <= n.train_nominal THEN e.session_end END) AS actual_train_end,
-    MAX(CASE WHEN e.session_end <= n.valid_nominal THEN e.session_end END) AS actual_valid_end,
-    n.data_end AS actual_test_end
-FROM nominal n
-CROSS JOIN _session_endpoints e
-GROUP BY n.data_start, n.data_end, n.train_nominal, n.valid_nominal;
-
 CREATE OR REPLACE TABLE _all_features AS
 WITH
-with_split AS (
-    SELECT
-        c.*,
-        CASE
-            WHEN c.session_end <= b.actual_train_end THEN 'train'
-            WHEN c.session_end <= b.actual_valid_end THEN 'valid'
-            ELSE 'test'
-        END AS split_name
-    FROM _cleaned_with_recency c
-    CROSS JOIN _split_boundaries b
-),
 with_player_history AS (
     SELECT
         *,
@@ -267,7 +305,7 @@ with_player_history AS (
         AVG(CASE WHEN rtp_bucket_id = 0 THEN 1.0 ELSE 0.0 END) OVER (PARTITION BY account, split_name ORDER BY starttime ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS player_pct_no_win,
         AVG(inter_spin_gap_sec) OVER (PARTITION BY account, split_name ORDER BY starttime ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS player_avg_round_duration,
         COUNT(DISTINCT sessionid) OVER (PARTITION BY account, split_name ORDER BY starttime ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS player_distinct_sessions
-    FROM with_split
+    FROM _cleaned_with_recency
 ),
 with_time AS (
     SELECT
@@ -334,6 +372,6 @@ SELECT
     END::INTEGER AS is_last_spin_in_session
 FROM with_ohe;
 
-COPY (SELECT * FROM _all_features WHERE split_name = 'train' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/train_features.parquet' (FORMAT PARQUET);
-COPY (SELECT * FROM _all_features WHERE split_name = 'valid' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/valid_features.parquet' (FORMAT PARQUET);
-COPY (SELECT * FROM _all_features WHERE split_name = 'test' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/test_features.parquet' (FORMAT PARQUET);
+COPY (SELECT * FROM _all_features WHERE split_name = 'train' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/train_features_fix.parquet' (FORMAT PARQUET);
+COPY (SELECT * FROM _all_features WHERE split_name = 'valid' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/valid_features_fix.parquet' (FORMAT PARQUET);
+COPY (SELECT * FROM _all_features WHERE split_name = 'test' ORDER BY account, starttime) TO '/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL/test_features_fix.parquet' (FORMAT PARQUET);

@@ -1,6 +1,6 @@
 import os
 
-DATA_DIR = "/Top/ACG/Year_2/trimester 3/capstone/data/ml/generic/fixed/"
+DATA_DIR = "/Top/ACG/Year_2/trimester 3/capstone/data/ml/DL"
 TRAIN_FILE = "train_features_fix.parquet"
 VALID_FILE = "valid_features_fix.parquet"
 TEST_FILE = "test_features_fix.parquet"

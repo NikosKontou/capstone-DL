@@ -20,7 +20,10 @@ from data_loader import load_splits, build_datasets, build_dataloaders
 from model import build_model
 from trainer import train_model
 from evaluate import evaluate_model, permutation_feature_importance
-from plots import plot_learning_curves, plot_predictions, plot_feature_importance
+from plots import (
+    plot_learning_curves, plot_predictions, plot_feature_importance,
+    plot_residuals, plot_per_step_vs_last_step, plot_error_vs_true_value,
+)
 
 
 def set_seed(seed: int):
@@ -96,6 +99,11 @@ def main():
     plot_learning_curves(history, run_dir)
     plot_predictions(plot_data["spins_true"], plot_data["spins_pred"], "spins_left", run_dir)
     plot_predictions(plot_data["bet_true"], plot_data["bet_pred"], "next_bet", run_dir)
+    plot_residuals(plot_data["spins_true"], plot_data["spins_pred"], "spins_left", run_dir)
+    plot_residuals(plot_data["bet_true"], plot_data["bet_pred"], "next_bet", run_dir)
+    plot_error_vs_true_value(plot_data["spins_true"], plot_data["spins_pred"], "spins_left", run_dir)
+    plot_error_vs_true_value(plot_data["bet_true"], plot_data["bet_pred"], "next_bet", run_dir)
+    plot_per_step_vs_last_step(test_metrics, run_dir)
     plot_feature_importance(feature_importance, run_dir)
 
     with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
